@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------- CONFIG ----------------
-TOKEN = "6467703195:AAFo7I8cSpI2swiIlI8iYxB8gwjP08kh4mM"  # <-- ضع توكن البوت هنا
+TOKEN = os.getenv("BOT_TOKEN")  # <-- ضع توكن البوت هنا
 DB_PATH = "quizbot.db"
 DOWNLOADS = "downloads"
 os.makedirs(DOWNLOADS, exist_ok=True)
