@@ -454,6 +454,55 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ رقم اختيار غير صالح.", reply_markup=main_menu_kb())
         USER_STATE.pop(user_id, None)
         return
+    # ======= استقبال نصوص التعديل =======
+
+    # تعديل نص السؤال
+    if state.get("action") == "edit_text":
+        db_id = state.get("db_id")
+        update_question_db(db_id, qtext=text)
+        USER_STATE.pop(user_id, None)
+        await update.message.reply_text("✅ تم تعديل نص السؤال بنجاح.", reply_markup=main_menu_kb())
+        return
+
+    # تعديل جميع الاختيارات دفعة واحدة
+    if state.get("action") == "edit_all_opts":
+        db_id = state.get("db_id")
+        lines = [clean_option_line(l) for l in text.splitlines() if l.strip()]
+        if not lines:
+            await update.message.reply_text("❌ لم يتم العثور على أي اختيارات.", reply_markup=main_menu_kb())
+            USER_STATE.pop(user_id, None)
+            return
+        update_question_db(db_id, options=lines)
+        USER_STATE.pop(user_id, None)
+        await update.message.reply_text("✅ تم تعديل جميع الاختيارات بنجاح.", reply_markup=main_menu_kb())
+        return
+
+    # حذف اختيار معيّن
+    if state.get("action") == "delete_opt":
+        db_id = state.get("db_id")
+        letter = text.strip().upper()
+        if not letter.isalpha() or not ('A' <= letter <= 'E'):
+            await update.message.reply_text("❌ أدخل حرفًا صحيحًا من A إلى E.", reply_markup=back_kb())
+            return
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT options_json FROM questions WHERE id=?", (db_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            await update.message.reply_text("❌ لم يتم العثور على السؤال.", reply_markup=main_menu_kb())
+            USER_STATE.pop(user_id, None)
+            return
+        opts = json.loads(row[0])
+        idx = ord(letter) - ord('A')
+        if 0 <= idx < len(opts):
+            del opts[idx]
+            update_question_db(db_id, options=opts)
+            await update.message.reply_text(f"🗑️ تم حذف الاختيار {letter}.", reply_markup=main_menu_kb())
+        else:
+            await update.message.reply_text("❌ رقم اختيار غير صالح.", reply_markup=main_menu_kb())
+        USER_STATE.pop(user_id, None)
+        return
 
     return
 
@@ -520,11 +569,18 @@ async def show_review_question(query, context, idx=0):
         nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"review_idx:{idx+1}"))
     if nav:
         buttons.append(nav)
+    buttons.append([InlineKeyboardButton("🔢 الانتقال إلى سؤال معين", callback_data="goto_question")])
 
     buttons.append([
-        InlineKeyboardButton("✏️ تعديل نص السؤال", callback_data=f"edit_text:{row['db_id']}"),
-        InlineKeyboardButton("✏️ تعديل اختيار", callback_data=f"edit_one:{row['db_id']}")
+        InlineKeyboardButton("✏️ تعديل اختيار", callback_data=f"edit_one:{row['db_id']}"),
+        InlineKeyboardButton("✏️ تعديل نص السؤال", callback_data=f"edit_text:{row['db_id']}")     
     ])
+
+    buttons.append([
+        InlineKeyboardButton("✏️ تعديل كل الاختيارات", callback_data=f"edit_all_opts:{row['db_id']}"),
+        InlineKeyboardButton("🗑️ حذف اختيار", callback_data=f"delete_opt:{row['db_id']}")
+    ])
+
 
     if opts:
         setrow = []
@@ -540,6 +596,37 @@ async def show_review_question(query, context, idx=0):
     buttons.append([InlineKeyboardButton("↩️ القائمة الرئيسية", callback_data="main")])
 
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def show_goto_menu(query, start=0):
+    rows = get_pending_questions_db()
+    if not rows:
+        await query.edit_message_text("❌ لا توجد أسئلة.", reply_markup=main_menu_kb())
+        return
+
+    total = len(rows)
+    end = min(start + 10, total)
+    btns = []
+
+    # عرض أرقام الأسئلة (كل 10 أرقام في صفحة)
+    for i in range(start, end):
+        btns.append([InlineKeyboardButton(f"{i+1}", callback_data=f"review_idx:{i}")])
+
+    # أزرار التنقل بين صفحات الأرقام
+    nav = []
+    if start > 0:
+        nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"goto_page:{start-10}"))
+    if end < total:
+        nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"goto_page:{end}"))
+    if nav:
+        btns.append(nav)
+
+    # زر الرجوع للمراجعة
+    btns.append([InlineKeyboardButton("↩️ رجوع", callback_data="review_idx:0")])
+
+    await query.edit_message_text(
+        f"اختر رقم السؤال للانتقال إليه (إجمالي {total} سؤال):",
+        reply_markup=InlineKeyboardMarkup(btns)
+    )
 
 
 # ---------- نشر ----------
@@ -683,17 +770,34 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_goto_menu(query, start=start)
         return
 
+    # ======= تعديل السؤال والاختيارات =======
     if data.startswith("edit_text:"):
         db_id = int(data.split(":")[1])
         USER_STATE[uid] = {"action": "edit_text", "db_id": db_id}
-        await query.edit_message_text("✏️ ابعت النص الجديد للسؤال الآن.", reply_markup=back_kb())
+        await query.edit_message_text("✏️ أرسل النص الجديد للسؤال:", reply_markup=back_kb())
         return
 
     if data.startswith("edit_one:"):
         db_id = int(data.split(":")[1])
         USER_STATE[uid] = {"action": "choose_edit_option", "db_id": db_id}
-        await query.edit_message_text("اكتب الحرف (A,B,C,D...) للاختيار الذي تريد تعديله:", reply_markup=back_kb())
+        await query.edit_message_text("اكتب الحرف (A,B,C,D,...) للاختيار الذي تريد تعديله:", reply_markup=back_kb())
         return
+
+    if data.startswith("edit_all_opts:"):
+        db_id = int(data.split(":")[1])
+        USER_STATE[uid] = {"action": "edit_all_opts", "db_id": db_id}
+        await query.edit_message_text(
+            "✏️ أرسل كل الاختيارات الجديدة كل اختيار في سطر (مثلاً:\nA- Kidney \nB- Lung \nC- الكبLiver...)", 
+            reply_markup=back_kb()
+        )
+        return
+
+    if data.startswith("delete_opt:"):
+        db_id = int(data.split(":")[1])
+        USER_STATE[uid] = {"action": "delete_opt", "db_id": db_id}
+        await query.edit_message_text("🗑️ اكتب الحرف (A–E) للاختيار الذي تريد حذفه:", reply_markup=back_kb())
+        return
+
 
     if data.startswith("set_correct:"):
         parts = data.split(":")
@@ -707,6 +811,15 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await publish_one_db(query.message.chat_id, context, db_id)
         await query.edit_message_text("✅ تم نشر السؤال هنا.", reply_markup=main_menu_kb())
         return
+    if data == "goto_question":
+        await show_goto_menu(query)
+        return
+
+    if data.startswith("goto_page:"):
+        start = int(data.split(":")[1])
+        await show_goto_menu(query, start=start)
+        return
+
 
     # fallback
     await query.edit_message_text("تم الضغط على زر غير معروف أو انتهت صلاحية الرسالة. ارجع إلى القائمة.", reply_markup=main_menu_kb())
