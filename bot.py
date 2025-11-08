@@ -1,4 +1,4 @@
-# bot.py — النسخة المحدثة: تعديل نفس الرسالة عند التنقل بين الأسئلة
+# bot.py — النسخة المحدثة: بتاريخ 8 نوفمبر 2025
 import os
 import re
 import json
@@ -10,8 +10,10 @@ import pdfplumber
 import pandas as pd
 from docx import Document
 from dotenv import load_dotenv
+import asyncio
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Poll, CallbackQuery
+from telegram.error import TimedOut, TelegramError
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
@@ -26,6 +28,14 @@ TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = "quizbot.db"
 DOWNLOADS = "downloads"
 os.makedirs(DOWNLOADS, exist_ok=True)
+
+# Publish tuning (configurable via environment variables)
+PUBLISH_RETRY = int(os.getenv("PUBLISH_RETRY", "3"))
+PUBLISH_DELAY = 0  # No delay between questions in a batch
+PUBLISH_RETRY_BACKOFF = float(os.getenv("PUBLISH_RETRY_BACKOFF", "1.0"))  # multiplier for retry backoff
+PUBLISH_MIN_DELAY = 0  # No minimum delay between questions
+PUBLISH_BATCH_SIZE = 10  # send this many questions before pause
+PUBLISH_BATCH_PAUSE = 3.0  # 3 second pause between batches
 
 # ---------- قاعدة البيانات ----------
 def init_db():
@@ -89,6 +99,16 @@ def delete_question_db(db_id: int):
     conn.commit()
     conn.close()
 
+def get_question_db(db_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, qtext, options_json, correct_letter FROM questions WHERE id=?", (db_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {"db_id": row[0], "qtext": row[1], "options": json.loads(row[2]), "correct": row[3]}
+    return None
+
 def delete_all_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -117,7 +137,13 @@ CHOICE_PATTERN = re.compile(r'([A-E])\s*[-\.\)]\s*(.*?)(?=(?:[A-E]\s*[-\.\)]|$))
 def split_choices_from_line(line: str):
     matches = list(CHOICE_PATTERN.finditer(line))
     if matches and len(matches) > 1:
-        return [m.group(2).strip() for m in matches]
+        options = []
+        for m in matches:
+            opt = m.group(2).strip()
+            if "Answers" in opt:  # If we find "Answers", stop processing more options
+                break
+            options.append(opt)
+        return options if options else None
     return None
 
 def clean_option_line(line: str) -> str:
@@ -132,6 +158,9 @@ def clean_option_line(line: str) -> str:
 def clean_question_text(q: str) -> str:
     if not q:
         return q
+    # Remove trailing numbers and any text after question mark
+    if '?' in q:
+        q = q.split('?')[0] + '?'
     q = re.sub(r'\s{2,}', ' ', q).strip()
     return q
 
@@ -230,6 +259,8 @@ def main_menu_kb():
         [InlineKeyboardButton("🧾 مراجعة الأسئلة", callback_data="review")],
         [InlineKeyboardButton("🅰️ (إدخال الإجابات (دفعة واحدة", callback_data="bulk_answers")],
         [InlineKeyboardButton("📤 نشر جميع الأسئلة هنا", callback_data="publish_all_here")],
+        [InlineKeyboardButton("📤 إرسال الأسئلة إلى شات آخر", callback_data="send_to_id")],
+        [InlineKeyboardButton("🆔 معرفة ID الجروب", callback_data="get_chat_id")],
         [InlineKeyboardButton("🗑️ حذف جميع الأسئلة", callback_data="delete_all")]
     ])
 
@@ -288,6 +319,8 @@ async def process_file_and_insert(update_or_query, context: ContextTypes.DEFAULT
 
 # ---------- معالجة النص (state machine) ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     user_id = update.message.from_user.id
     text = (update.message.text or "").strip()
     state = USER_STATE.get(user_id)
@@ -463,6 +496,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_STATE.pop(user_id, None)
         await update.message.reply_text("✅ تم تعديل نص السؤال بنجاح.", reply_markup=main_menu_kb())
         return
+        
+    # إضافة اختيار جديد
+    if state.get("action") == "add_opt":
+        db_id = state.get("db_id")
+        row = get_question_db(db_id)
+        if not row:
+            await update.message.reply_text("❌ السؤال غير موجود.", reply_markup=main_menu_kb())
+            USER_STATE.pop(user_id, None)
+            return
+            
+        opts = row["options"] if row["options"] else []
+        if len(opts) >= 5:
+            await update.message.reply_text("❌ لا يمكن إضافة المزيد من الاختيارات.", reply_markup=main_menu_kb())
+            USER_STATE.pop(user_id, None)
+            return
+            
+        opts.append(clean_option_line(text))
+        update_question_db(db_id, options=opts)
+        await update.message.reply_text(f"✅ تم إضافة الاختيار {chr(65+len(opts)-1)}.", reply_markup=main_menu_kb())
+        USER_STATE.pop(user_id, None)
+        return
 
     # تعديل جميع الاختيارات دفعة واحدة
     if state.get("action") == "edit_all_opts":
@@ -503,8 +557,40 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ رقم اختيار غير صالح.", reply_markup=main_menu_kb())
         USER_STATE.pop(user_id, None)
         return
+    # ====== إرسال الأسئلة إلى ID آخر ======
+    if state.get("action") == "await_target_id":
+        target_id = text.strip()
+        USER_STATE.pop(user_id, None)
+        try:
+            # إرسال رسالة تأكيد في محادثة البوت
+            await update.message.reply_text(f"📤 جاري إرسال الأسئلة إلى الشات ID: `{target_id}` ...", parse_mode="Markdown")
+            # تمرير محادثة البوت كمكان لعرض التقدم
+            await publish_all_to_chat(int(target_id), context, is_same_chat=False, progress_chat_id=update.message.chat_id)
+        except Exception as e:
+            await update.message.reply_text(f"❌ فشل الإرسال.\nتأكد أن البوت عضو في الشات وله صلاحية إرسال الرسائل.\n\nالخطأ:\n`{e}`", parse_mode="Markdown", reply_markup=main_menu_kb())
+        return
 
-    return
+# ✅ عندما يستقبل البوت رسالة من قناة، يرسل الـ ID على الخاص للمسؤول
+async def detect_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send channel ID to the bot owner when the bot receives a channel message.
+
+    The function is tolerant if update has no chat. Replace admin_id with your
+    personal Telegram ID.
+    """
+    chat = update.effective_chat
+    if not chat:
+        return
+    if chat.type == "channel":
+        admin_id = 1101824671  # ← ضع هنا الـ ID الخاص بك (مش اسم المستخدم)
+        msg = (
+            f"📢 تم استقبال رسالة من قناة:\n"
+            f"📛 الاسم: {chat.title}\n"
+            f"🆔 ID القناة: `{chat.id}`"
+        )
+        try:
+            await context.bot.send_message(admin_id, msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("لم أستطع إرسال ID القناة إلى الخاص: %s", e)
 
 # ---------- عرض قوائم وحذف ونشر ----------
 async def show_delete_list(query: CallbackQuery, context, start=0, page_size=10):
@@ -531,24 +617,7 @@ async def show_delete_list(query: CallbackQuery, context, start=0, page_size=10)
     text = "اختر سؤال للحذف:\n\n" + "\n".join(text_lines)
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
-async def show_goto_menu(query: CallbackQuery, start=0):
-    rows = get_pending_questions_db()
-    if not rows:
-        await query.edit_message_text("لا توجد أسئلة.", reply_markup=main_menu_kb())
-        return
-    end = min(start + 10, len(rows))
-    btns = []
-    for i in range(start, end):
-        btns.append([InlineKeyboardButton(f"{i+1}", callback_data=f"review:{i}")])
-    nav = []
-    if start > 0:
-        nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"goto_page:{max(0, start-10)}"))
-    if end < len(rows):
-        nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"goto_page:{start+10}"))
-    if nav:
-        btns.append(nav)
-    btns.append([InlineKeyboardButton("↩️ رجوع", callback_data="review")])
-    await query.edit_message_text("اختر رقم السؤال:", reply_markup=InlineKeyboardMarkup(btnns := btns))  # small py trick
+# (removed duplicate/buggy `show_goto_menu` - the improved version appears later)
 
 async def show_review_question(query, context, idx=0):
     row = get_question_db_by_index(idx)
@@ -559,6 +628,11 @@ async def show_review_question(query, context, idx=0):
     opts = row["options"]
     opts_text = "\n".join([f"{chr(65+i)}) {opt}" for i, opt in enumerate(opts)]) if opts else "(لا توجد اختيارات)"
     corr = row["correct"] if row["correct"] else "-"
+    
+    # Count options
+    opt_count = len(opts) if opts else 0
+    can_add_option = opt_count < 5  # Maximum 5 options (A-E)
+    
     text = f"السؤال {idx+1}/{row['total']}:\n\n{row['qtext']}\n\n{opts_text}\n\nالإجابة الصحيحة: {corr}"
 
     buttons = []
@@ -580,6 +654,12 @@ async def show_review_question(query, context, idx=0):
         InlineKeyboardButton("✏️ تعديل كل الاختيارات", callback_data=f"edit_all_opts:{row['db_id']}"),
         InlineKeyboardButton("🗑️ حذف اختيار", callback_data=f"delete_opt:{row['db_id']}")
     ])
+    
+    # Add the "Add option" button if we have room for more options
+    if can_add_option:
+        buttons.append([
+            InlineKeyboardButton("➕ إضافة اختيار", callback_data=f"add_opt:{row['db_id']}")
+        ])
 
 
     if opts:
@@ -648,39 +728,189 @@ async def publish_one_db(chat_id, context: ContextTypes.DEFAULT_TYPE, db_id: int
             correct_index = idx
     if correct_index is None:
         correct_index = 0
-    await context.bot.send_poll(
-        chat_id=chat_id,
-        question=qtext,
-        options=opts_json,
-        type=Poll.QUIZ,
-        correct_option_id=correct_index,
-        is_anonymous=True
-    )
-    mark_published_db(db_id)
-    return True
+    # Retry on timeout up to 3 attempts with exponential backoff
+    attempts = 0
+    while attempts < PUBLISH_RETRY:
+        try:
+            await context.bot.send_poll(
+                chat_id=chat_id,
+                question=qtext,
+                options=opts_json,
+                type=Poll.QUIZ,
+                correct_option_id=correct_index,
+                is_anonymous=True
+            )
+            mark_published_db(db_id)
+            return True
+        except TimedOut:
+            attempts += 1
+            logger.warning("Timed out sending poll db_id=%s to chat=%s (attempt %s)", db_id, chat_id, attempts)
+            # backoff: increase sleep with attempts
+            await asyncio.sleep(PUBLISH_RETRY_BACKOFF * attempts)
+            continue
+        except TelegramError as e:
+            logger.exception("Telegram error sending poll db_id=%s to chat=%s: %s", db_id, chat_id, e)
+            return False
+        except Exception as e:
+            logger.exception("Unexpected error sending poll db_id=%s to chat=%s: %s", db_id, chat_id, e)
+            return False
+    logger.error("Failed to send poll db_id=%s to chat=%s after %s attempts", db_id, chat_id, attempts)
+    return False
 
-async def publish_all_to_chat(chat_id, context: ContextTypes.DEFAULT_TYPE):
+async def publish_all_to_chat(chat_id, context: ContextTypes.DEFAULT_TYPE, is_same_chat: bool = False, progress_chat_id: int = None):
     rows = get_pending_questions_db()
     total = len(rows)
     if total == 0:
-        await context.bot.send_message(chat_id, "❌ لا توجد أسئلة لإرسالها.", reply_markup=main_menu_kb())
+        await context.bot.send_message(progress_chat_id or chat_id, "❌ لا توجد أسئلة لإرسالها.", reply_markup=main_menu_kb())
         return
 
     sent = 0
-    for r in rows:
-        ok = await publish_one_db(chat_id, context, r["db_id"])
-        if ok:
-            sent += 1
-
-    remaining = pending_count_db()
-
-    if remaining == 0:
-        msg = f"✅ تم إرسال جميع الأسئلة ({sent}/{total}) بنجاح."
+    failed_ids = []
+    
+    # تحديد التأخير بناءً على مكان النشر
+    current_delay = 0 if is_same_chat else PUBLISH_DELAY
+    
+    # إرسال رسالة التقدم في بداية العملية دائماً في محادثة البوت
+    progress_msg = None
+    try:
+        progress_msg = await context.bot.send_message(
+            chat_id=progress_chat_id or chat_id,  # استخدم محادثة البوت للتقدم
+            text=f"🚀 جاري نشر {total} سؤال...\n{'إلى نفس المحادثة' if is_same_chat else f'إلى محادثة أخرى (ID: {chat_id})'}\nتم: 0/{total}"
+        )
+    except Exception:
+        logger.warning("لم نتمكن من إرسال رسالة التقدم")
+    
+    if is_same_chat:
+        logger.info("النشر في نفس المحادثة - سيتم الإرسال بدون تأخير")
     else:
-        msg = f"✅ تم إرسال {sent} من أصل {total} سؤال.\n📚 المتبقي: {remaining} سؤال لم يتم إرساله بعد."
+        logger.info("النشر في محادثة أخرى - سيتم استخدام التأخير")
+    
+    success = True
+    
+    # Process in batches of PUBLISH_BATCH_SIZE
+    for batch_start in range(0, len(rows), PUBLISH_BATCH_SIZE):
+        batch = rows[batch_start:batch_start + PUBLISH_BATCH_SIZE]
+        batch_sent = 0
+        
+        # Send each question in the batch
+        for r in batch:
+            try:
+                ok = await publish_one_db(chat_id, context, r["db_id"])
+                if ok:
+                    sent += 1
+                    batch_sent += 1
+                    logger.info("✓ تم إرسال السؤال %s (%d/%d)", r["db_id"], sent, total)
+                else:
+                    failed_ids.append(r["db_id"])
+                    logger.warning("✗ فشل إرسال السؤال %s", r["db_id"])
+            except TimedOut:
+                logger.warning("⌛ تأخر إرسال السؤال %s", r["db_id"])
+                failed_ids.append(r["db_id"])
+            except TelegramError as e:
+                if "Flood control exceeded" in str(e):
+                    try:
+                        wait_sec = float(str(e).split("Retry in ")[1].split(" ")[0])
+                        current_delay = max(current_delay, wait_sec / 10)
+                        logger.info("⚠️ تم تعديل وقت التأخير إلى %.1f ثانية", current_delay)
+                        await asyncio.sleep(wait_sec)
+                    except Exception:
+                        current_delay = max(current_delay * 1.5, PUBLISH_MIN_DELAY)
+                    failed_ids.append(r["db_id"])
+                else:
+                    logger.warning("❌ خطأ تيليجرام عند إرسال السؤال %s", r["db_id"])
+                    failed_ids.append(r["db_id"])
+            except Exception:
+                logger.warning("❌ خطأ غير متوقع عند إرسال السؤال %s", r["db_id"])
+                failed_ids.append(r["db_id"])
+                success = False
 
-    # إرسال رسالة النتيجة + الرجوع للقائمة الرئيسية
-    await context.bot.send_message(chat_id, msg, reply_markup=main_menu_kb())
+            # تحديث رسالة التقدم بعد كل سؤال
+            if progress_msg:
+                try:
+                    status_msg = f"🚀 جاري نشر {total} سؤال...\n"
+                    status_msg += f"✅ تم بنجاح: {sent}/{total}\n"
+                    if failed_ids:
+                        status_msg += f"❌ فشل إرسال: {len(failed_ids)}"
+                    await context.bot.edit_message_text(
+                        text=status_msg,
+                        chat_id=progress_msg.chat_id,
+                        message_id=progress_msg.message_id
+                    )
+                except Exception:
+                    pass  # تجاهل أي خطأ في تحديث رسالة التقدم
+            
+        # After completing a batch, take a pause if more questions remain (only for different chat)
+        if not is_same_chat and batch_start + len(batch) < total:
+            logger.info("⏳ راحة %d ثواني بعد إرسال %d سؤال من الدفعة", PUBLISH_BATCH_PAUSE, batch_sent)
+            
+            if progress_msg:
+                try:
+                    pause_msg = f"🚀 جاري نشر {total} سؤال...\n"
+                    pause_msg += f"✅ تم بنجاح: {sent}/{total}\n"
+                    if failed_ids:
+                        pause_msg += f"❌ فشل إرسال: {len(failed_ids)}\n"
+                    pause_msg += f"⏳ راحة {PUBLISH_BATCH_PAUSE} ثواني..."
+                    
+                    await context.bot.edit_message_text(
+                        text=pause_msg,
+                        chat_id=progress_msg.chat_id,
+                        message_id=progress_msg.message_id
+                    )
+                except Exception:
+                    pass
+            
+            await asyncio.sleep(PUBLISH_BATCH_PAUSE)  # راحة بين الدفعات
+    # إظهار النتيجة النهائية
+    remaining = pending_count_db()
+    
+    # تحديث رسالة التقدم النهائية
+    if progress_msg:
+        try:
+            final_msg = f"✅ اكتملت العملية!\n\n"
+            final_msg += f"� إحصائيات النشر:\n"
+            final_msg += f"• إجمالي الأسئلة: {total}\n"
+            final_msg += f"• تم إرسال بنجاح: {sent}\n"
+            if failed_ids:
+                final_msg += f"• فشل إرسال: {len(failed_ids)}\n"
+            if remaining > 0:
+                final_msg += f"• متبقي في القاعدة: {remaining}\n"
+            
+            await context.bot.edit_message_text(
+                text=final_msg,
+                chat_id=progress_msg.chat_id,
+                message_id=progress_msg.message_id
+            )
+        except Exception:
+            pass
+            
+    # تحديث الرسالة النهائية
+    final_msg = f"✅ اكتملت العملية!\n\n"
+    final_msg += f"📊 إحصائيات النشر:\n"
+    final_msg += f"• إجمالي الأسئلة: {total}\n"
+    final_msg += f"• تم إرسال بنجاح: {sent}\n"
+    if failed_ids:
+        final_msg += f"• فشل إرسال: {len(failed_ids)}\n"
+    if remaining > 0:
+        final_msg += f"• متبقي في القاعدة: {remaining}\n"
+    
+    # إرسال رسالة جديدة بالإحصائيات النهائية والقائمة
+    try:
+        # أولاً، نحدث رسالة التقدم لتظهر أنه تم الانتهاء
+        if progress_msg:
+            await context.bot.edit_message_text(
+                text=final_msg,
+                chat_id=progress_msg.chat_id,
+                message_id=progress_msg.message_id
+            )
+        
+        # ثم نرسل رسالة جديدة مع القائمة
+        await context.bot.send_message(
+            chat_id=progress_msg.chat_id if progress_msg else chat_id,
+            text="✅ تم نشر الأسئلة بنجاح!\nاختر إجراء من القائمة أدناه:",
+            reply_markup=main_menu_kb()
+        )
+    except Exception as e:
+        logger.warning(f"خطأ عند إرسال رسالة الإكمال: {e}")
 
 # ---------- التعامل مع الأزرار ----------
 async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -722,8 +952,8 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "publish_all_here":
-        await publish_all_to_chat(query.message.chat_id, context)
-        await query.edit_message_text("✅ تم نشر كل الأسئلة هنا.", reply_markup=main_menu_kb())
+        # عند النشر في نفس المحادثة نستخدم is_same_chat=True
+        await publish_all_to_chat(query.message.chat_id, context, is_same_chat=True, progress_chat_id=query.message.chat_id)
         return
 
     if data == "pdf_confirm":
@@ -797,6 +1027,16 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_STATE[uid] = {"action": "delete_opt", "db_id": db_id}
         await query.edit_message_text("🗑️ اكتب الحرف (A–E) للاختيار الذي تريد حذفه:", reply_markup=back_kb())
         return
+        
+    if data.startswith("add_opt:"):
+        db_id = int(data.split(":")[1])
+        row = get_question_db(db_id)
+        if row and (not row["options"] or len(row["options"]) < 5):
+            USER_STATE[uid] = {"action": "add_opt", "db_id": db_id}
+            await query.edit_message_text("✏️ أرسل نص الاختيار الجديد:", reply_markup=back_kb())
+        else:
+            await query.answer("لا يمكن إضافة المزيد من الاختيارات")
+        return
 
 
     if data.startswith("set_correct:"):
@@ -808,8 +1048,12 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("publish:"):
         db_id = int(data.split(":")[1])
-        await publish_one_db(query.message.chat_id, context, db_id)
-        await query.edit_message_text("✅ تم نشر السؤال هنا.", reply_markup=main_menu_kb())
+        # نشر السؤال الواحد
+        success = await publish_one_db(query.message.chat_id, context, db_id)
+        if success:
+            await query.edit_message_text("✅ تم نشر السؤال بنجاح.")
+        else:
+            await query.edit_message_text("❌ حدث خطأ أثناء نشر السؤال.", reply_markup=main_menu_kb())
         return
     if data == "goto_question":
         await show_goto_menu(query)
@@ -820,9 +1064,50 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_goto_menu(query, start=start)
         return
 
-
+    if data == "send_to_id":
+        USER_STATE[uid] = {"action": "await_target_id"}
+        await query.edit_message_text("📮 أرسل الآن الـ Chat ID للجروب أو القناة التي تريد إرسال الأسئلة إليها.\n\n📌 ملاحظة: تأكد أن البوت عضو في هذا الجروب أو القناة وله صلاحية إرسال الرسائل.", reply_markup=back_kb())
+        return
+    if data == "get_chat_id":
+        chat = query.message.chat
+        msg = (
+            f"📍 *Chat Info:*\n"
+            f"👤 Name: {chat.title or chat.first_name or '—'}\n"
+            f"💬 Type: {chat.type}\n"
+            f"🆔 ID: `{chat.id}`"
+        )
+        try:
+            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=main_menu_kb())
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                pass  # تجاهل الخطأ لو نفس الرسالة
+            else:
+                raise
+        return
     # fallback
-    await query.edit_message_text("تم الضغط على زر غير معروف أو انتهت صلاحية الرسالة. ارجع إلى القائمة.", reply_markup=main_menu_kb())
+
+# ✅ يلتقط أي رسالة من قناة ويرسل الـ ID لصاحب البوت على الخاص
+async def detect_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.channel_post:
+        return
+
+    chat = update.channel_post.chat
+    admin_id = 1101824671  # ← ضع هنا ID حسابك الشخصي
+
+    msg = (
+        f"📢 تم استقبال منشور من قناة:\n"
+        f"📛 الاسم: {chat.title}\n"
+        f"🆔 ID القناة: `{chat.id}`"
+    )
+
+    try:
+        await context.bot.send_message(admin_id, msg, parse_mode="Markdown")
+        print(f"✅ تم إرسال ID القناة إليك على الخاص ({admin_id})")
+    except Exception as e:
+        print(f"⚠️ لم أستطع إرسال ID القناة إلى الخاص: {e}")
+
+# removed stray top-level async send loop (leftover code)
+# the publish/send logic is handled by `publish_one_db` and `publish_all_to_chat`
 
 # ---------- أوامر ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -837,6 +1122,8 @@ def main():
     app.add_handler(CallbackQueryHandler(button_router))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, detect_channel_post))
+
 
     print("Bot started.")
     app.run_polling()
