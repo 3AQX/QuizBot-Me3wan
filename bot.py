@@ -1374,3 +1374,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+#   V e r s i o n :   1 . 0 . 1   ( A r a b i c   &   T e x t   P a r s i n g   F i x )  
+ 
