@@ -1,4 +1,4 @@
-# bot.py — النسخة المحدثة: بتاريخ 8 نوفمبر 2025
+# bot.py — النسخة المحدثة: بتاريخ 11 ابريل 2026
 import os
 import re
 import json
@@ -72,6 +72,29 @@ def get_pending_questions_db():
     conn.close()
     return [{"db_id": r[0], "qtext": r[1], "options": json.loads(r[2]), "correct": r[3]} for r in rows]
 
+def get_flagged_questions_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, qtext, options_json, correct_letter FROM questions WHERE status='pending' ORDER BY id")
+    rows = c.fetchall()
+    conn.close()
+    flagged = []
+    for r in rows:
+        db_id, qtext, options_json, correct = r
+        opts = json.loads(options_json)
+        reasons = []
+        if len(qtext) > 300:
+            reasons.append(f"طول السؤال ({len(qtext)} حرف) أطول من المسموح 300")
+        if len(opts) > 10:
+            reasons.append(f"عدد الخيارات ({len(opts)}) يتجاوز 10")
+        for i, opt in enumerate(opts):
+            if len(opt) > 100:
+                reasons.append(f"الخيار {chr(65+i)} أطول من المسموح 100")
+                break
+        if reasons:
+            flagged.append({"db_id": db_id, "qtext": qtext, "options": opts, "correct": correct, "reasons": reasons})
+    return flagged
+
 def get_unanswered_questions_db():
     """إرجاع الأسئلة المعلقة التي لا تحتوي على إجابة صحيحة."""
     conn = sqlite3.connect(DB_PATH)
@@ -83,8 +106,8 @@ def get_unanswered_questions_db():
     conn.close()
     return [{"db_id": r[0], "qtext": r[1]} for r in rows]
 
-def get_question_db_by_index(idx: int):
-    rows = get_pending_questions_db()
+def get_question_db_by_index(idx: int, flagged_only: bool = False):
+    rows = get_flagged_questions_db() if flagged_only else get_pending_questions_db()
     if 0 <= idx < len(rows):
         row = rows[idx]
         row["index"] = idx
@@ -380,16 +403,21 @@ USER_STATE = {}  # user_id -> dict(action, step, tmp, ...)
 
 # ---------- أزرار الواجهة ----------
 def main_menu_kb():
-    return InlineKeyboardMarkup([
+    flagged_count = len(get_flagged_questions_db())
+    flagged_btn = [[InlineKeyboardButton(f"⚠️ مراجعة المرفوضة ({flagged_count})", callback_data="review_flagged")]] if flagged_count > 0 else []
+    
+    kb = [
         [InlineKeyboardButton("📄 تحميل ملف", callback_data="upload")],
         [InlineKeyboardButton("✍️ إضافة سؤال يدوي", callback_data="add_manual")],
-        [InlineKeyboardButton("🧾 مراجعة الأسئلة", callback_data="review")],
+        [InlineKeyboardButton("🧾 مراجعة الأسئلة", callback_data="review")]
+    ] + flagged_btn + [
         [InlineKeyboardButton("🅰️ (إدخال الإجابات (دفعة واحدة", callback_data="bulk_answers")],
         [InlineKeyboardButton("📤 نشر جميع الأسئلة هنا", callback_data="publish_all_here")],
         [InlineKeyboardButton("📤 إرسال الأسئلة إلى شات آخر", callback_data="send_to_id")],
         [InlineKeyboardButton("🆔 معرفة ID الجروب", callback_data="get_chat_id")],
         [InlineKeyboardButton("🗑️ حذف جميع الأسئلة", callback_data="delete_all")]
-    ])
+    ]
+    return InlineKeyboardMarkup(kb)
 
 def back_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ رجوع", callback_data="main")]])
@@ -808,8 +836,8 @@ async def show_delete_list(query: CallbackQuery, context, start=0, page_size=10)
 
 # (removed duplicate/buggy `show_goto_menu` - the improved version appears later)
 
-async def show_review_question(query, context, idx=0):
-    row = get_question_db_by_index(idx)
+async def show_review_question(query, context, idx=0, flagged_only=False):
+    row = get_question_db_by_index(idx, flagged_only=flagged_only)
     is_query = isinstance(query, CallbackQuery)
     if not row:
         if is_query:
@@ -827,16 +855,22 @@ async def show_review_question(query, context, idx=0):
     can_add_option = opt_count < 10  # تليجرام يدعم حتى 10 خيارات
     
     text = f"السؤال {idx+1}/{row['total']}:\n\n{row['qtext']}\n\n{opts_text}\n\nالإجابة الصحيحة: {corr}"
+    if flagged_only and "reasons" in row:
+        reasons_text = "\n".join([f"• {r}" for r in row["reasons"]])
+        text = f"🚨 **مرفوض للأسباب التالية:** 🚨\n{reasons_text}\n\n" + text
 
     buttons = []
     nav = []
+    prefix = "review_flagged_idx" if flagged_only else "review_idx"
     if idx > 0:
-        nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"review_idx:{idx-1}"))
+        nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"{prefix}:{idx-1}"))
     if idx + 1 < row["total"]:
-        nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"review_idx:{idx+1}"))
+        nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"{prefix}:{idx+1}"))
     if nav:
         buttons.append(nav)
-    buttons.append([InlineKeyboardButton("🔢 الانتقال إلى سؤال معين", callback_data="goto_question")])
+        
+    if not flagged_only:
+        buttons.append([InlineKeyboardButton("🔢 الانتقال إلى سؤال معين", callback_data="goto_question")])
 
     buttons.append([
         InlineKeyboardButton("✏️ تعديل اختيار", callback_data=f"edit_one:{row['db_id']}"),
@@ -1146,7 +1180,19 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("لا توجد أسئلة محفوظة حالياً.", reply_markup=main_menu_kb())
             return
         # هنا نمرر whole callback query كي الدالة تعدّل نفس الرسالة
-        await show_review_question(query, context, idx=0)
+        await show_review_question(query, context, idx=0, flagged_only=False)
+        return
+
+    if data == "review_flagged":
+        if len(get_flagged_questions_db()) == 0:
+            await query.edit_message_text("لا توجد أسئلة مرفوضة حالياً.", reply_markup=main_menu_kb())
+            return
+        await show_review_question(query, context, idx=0, flagged_only=True)
+        return
+
+    if data.startswith("review_flagged_idx:"):
+        idx = int(data.split(":")[1])
+        await show_review_question(query, context, idx=idx, flagged_only=True)
         return
 
     if data == "delete_all":
@@ -1375,5 +1421,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-#   V e r s i o n :   1 . 0 . 1   ( A r a b i c   &   T e x t   P a r s i n g   F i x )  
- 
