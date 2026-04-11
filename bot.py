@@ -227,10 +227,10 @@ def _parse_questions_from_lines(lines: List[str]) -> List[dict]:
             current_q = {"question": qm.group(1).strip(), "options": []}
             continue
         # نمط رقمي: 1. أو 1- أو 1) أو 1:
-        if re.match(r'^\s*\d+\s*[\.\-\)\:]', line_s):
+        if re.match(r'^\s*[\d٠-٩]+\s*[\.\-\)\:]', line_s):
             if current_q:
                 questions.append(current_q)
-            qtxt = re.sub(r'^\s*\d+\s*[\.\-\)\:]\s*', '', line_s).strip()
+            qtxt = re.sub(r'^\s*[\d٠-٩]+\s*[\.\-\)\:]\s*', '', line_s).strip()
             current_q = {"question": qtxt, "options": []}
             continue
         # نمط اختيار: A- أو A. أو A) أو أ- أو أ.
@@ -338,7 +338,7 @@ def parse_questions_from_file(file_path: str, pdf_pages: List[int] = None):
                     continue
                 text = p.text.strip()
                 has_auto_num = p._p.find(f'{NS}numPr') is not None
-                already_numbered = bool(re.match(r'^\s*\d+', text))
+                already_numbered = bool(re.match(r'^\s*[\d٠-٩]+', text))
                 is_option = bool(re.match(r'^\s*[A-Ja-j]\s*[\.\-\)]', text))
                 if has_auto_num and not already_numbered and not is_option:
                     auto_counter += 1
