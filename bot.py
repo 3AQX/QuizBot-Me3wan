@@ -144,17 +144,17 @@ def pending_count_db():
     return cnt
 
 # ---------- تحليل النص و تنظيف الاختيارات ----------
-# دعم حتى 10 خيارات (A إلى J)
-CHOICE_PATTERN = re.compile(r'([A-Ja-j])\s*[-\.\)]\s*(.*?)(?=(?:[A-Ja-j]\s*[-\.\)]|$))', re.I | re.S)
+# دعم حتى 10 خيارات (A-J أو أ-ي)
+CHOICE_PATTERN = re.compile(r'([A-Ja-jأ-ي])\s*[-\.\)]\s*(.*?)(?=(?:[A-Ja-jأ-ي]\s*[-\.\)]|$))', re.I | re.S)
 
 # أنماط الأسطر التي يجب تجاهلها لمنع تلوث نص السؤال
 IGNORE_LINE_PATTERNS = [
-    re.compile(r'^\s*(Answer[s]?|Correct|Solution|Note[s]?|Reference[s]?|Source|Figure|Table)\s*[\:\-]', re.I),
+    re.compile(r'^\s*(Answer[s]?|Correct|Solution|Note[s]?|Reference[s]?|Source|Figure|Table|الإجابة|الحل|ملاحظة)\s*[\:\-]', re.I),
     re.compile(r'^\s*[\*\-_=]{3,}\s*$'),
 ]
 
-# نمط السؤال بصيغة Q: أو Question:
-Q_PREFIX_PATTERN = re.compile(r'^\s*(?:Q\.?\s*\d*|Question\.?\s*\d*)\s*[\:\-]\s*(.+)', re.I)
+# نمط السؤال بصيغة Q: أو Question: أو س: أو سؤال:
+Q_PREFIX_PATTERN = re.compile(r'^\s*(?:Q\.?\s*\d*|Question\.?\s*\d*|سؤال\.?\s*\d*|س\.?\s*\d*)\s*[\:\-]\s*(.+)', re.I)
 
 def is_ignored_line(line: str) -> bool:
     for pat in IGNORE_LINE_PATTERNS:
@@ -180,7 +180,7 @@ def clean_option_line(line: str) -> str:
     يدعم الآن حتى J (10 خيارات).
     """
     line = line.strip()
-    cleaned = re.sub(r'^[A-Ja-j]\s*[-\.\)]\s*', '', line)
+    cleaned = re.sub(r'^[A-Ja-jأ-ي\d]\s*[-\.\)]\s*', '', line)
     return cleaned
 
 def clean_question_text(q: str) -> str:
@@ -233,8 +233,8 @@ def _parse_questions_from_lines(lines: List[str]) -> List[dict]:
             qtxt = re.sub(r'^\s*\d+\s*[\.\-\)\:]\s*', '', line_s).strip()
             current_q = {"question": qtxt, "options": []}
             continue
-        # نمط اختيار: A- أو A. أو A)
-        if re.match(r'^\s*[A-Ja-j]\s*[\.\-\)]', line_s):
+        # نمط اختيار: A- أو A. أو A) أو أ- أو أ.
+        if re.match(r'^\s*([A-Ja-jأ-ي])\s*[\.\-\)]', line_s):
             if current_q is None:
                 continue
             multi = split_choices_from_line(line_s)
@@ -262,9 +262,9 @@ def _fallback_parser(lines: List[str]) -> List[dict]:
             continue
         next_is_opt = (
             i + 1 < len(lines)
-            and re.match(r'^\s*[A-Ja-j]\s*[\.\-\)]', lines[i + 1].strip())
+            and re.match(r'^\s*([A-Ja-jأ-ي])\s*[\.\-\)]', lines[i + 1].strip())
         )
-        if next_is_opt and len(line) < 1000 and not re.match(r'^\s*[A-Ja-j]\s*[\.\-\)]', line):
+        if next_is_opt and len(line) < 1000 and not re.match(r'^\s*([A-Ja-jأ-ي])\s*[\.\-\)]', line):
             current_q = {"question": line, "options": []}
             i += 1
             while i < len(lines):
@@ -272,7 +272,7 @@ def _fallback_parser(lines: List[str]) -> List[dict]:
                 if not opt_line:
                     i += 1
                     break
-                if re.match(r'^\s*[A-Ja-j]\s*[\.\-\)]', opt_line):
+                if re.match(r'^\s*([A-Ja-jأ-ي])\s*[\.\-\)]', opt_line):
                     multi = split_choices_from_line(opt_line)
                     if multi:
                         for m in multi:
@@ -504,6 +504,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if flagged > 0:
                 msg += f"\n\n⚠️ انتبه: تم اكتشاف {flagged} أسئلة تتجاوز 300 حرف لطول السؤال أو يبلغ عدد خياراتها أكثر من 10.\nيرجى تعديلها يدوياً من قسم المراجعة للتمكن من نشرها في تيليجرام."
             await update.message.reply_text(msg, reply_markup=main_menu_kb())
+        else:
+            # رد توضيحي في حال لم يتم العثور على أسئلة
+            await update.message.reply_text(
+                "⚠️ لم يتم العثور على أسئلة في رسالتك بتنسيق معروف.\n\n"
+                "تأكد من استخدام تنسيق مثل:\n"
+                "1. ما هي عاصمة فرنسا؟\n"
+                "أ- باريس\n"
+                "ب- لندن\n\n"
+                "أو أرسل ملفاً ليتم تحليله.",
+                reply_markup=main_menu_kb()
+            )
         return
 
     # PDF pages selection
