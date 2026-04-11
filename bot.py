@@ -226,9 +226,9 @@ def parse_pdf_pages(file_path: str, selected_pages: List[int]) -> List[str]:
             for i in selected:
                 text = pages[i].extract_text()
                 if text:
-                    for l in text.splitlines():
-                        if l.strip():
-                            lines.append(l.strip())
+                    for line in text.splitlines():
+                        if line.strip():
+                            lines.append(line.strip())
     except Exception:
         logger.exception("خطأ أثناء قراءة صفحات PDF")
     return lines
@@ -337,21 +337,21 @@ def parse_questions_from_file(file_path: str, pdf_pages: List[int] = None):
                     continue
             if not loaded:
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    lines = [l.rstrip("\n") for l in f if l.strip()]
+                    lines = [line.rstrip("\n") for line in f if line.strip()]
         elif ext == ".txt":
             # دعم عدة ترميزات مع أولوية UTF-8-SIG للملفات العربية
             lines_loaded = False
             for enc in ["utf-8-sig", "utf-8", "cp1256", "latin-1"]:
                 try:
                     with open(file_path, "r", encoding=enc, errors="strict") as f:
-                        lines = [l.rstrip("\n") for l in f if l.strip()]
+                        lines = [line.rstrip("\n") for line in f if line.strip()]
                     lines_loaded = True
                     break
                 except Exception:
                     continue
             if not lines_loaded:
                 with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                    lines = [l.rstrip("\n") for l in f if l.strip()]
+                    lines = [line.rstrip("\n") for line in f if line.strip()]
         elif ext == ".docx":
             doc = Document(file_path)
             auto_counter = 0
@@ -376,9 +376,9 @@ def parse_questions_from_file(file_path: str, pdf_pages: List[int] = None):
                     for page in pdf.pages:
                         text = page.extract_text()
                         if text:
-                            for l in text.splitlines():
-                                if l.strip():
-                                    lines.append(l.strip())
+                            for line in text.splitlines():
+                                if line.strip():
+                                    lines.append(line.strip())
         else:
             return None
     except Exception:
@@ -591,13 +591,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✍️ أرسل الآن الاختيارات — كل اختيار في سطر واحد، أو ارسلهما بصيغة A-.. B-..", reply_markup=back_kb())
             return
         elif step == 2:
-            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
             joined = " ".join(lines)
             multi = split_choices_from_line(joined)
             if multi:
                 opts = [clean_option_line(m) for m in multi]
             else:
-                opts = [clean_option_line(l) for l in lines if l.strip()]
+                opts = [clean_option_line(line) for line in lines if line.strip()]
             tmp["options"] = opts
             USER_STATE[user_id] = {"action": "manual_add", "step": 3, "tmp": tmp}
             await update.message.reply_text("✅ اكتب رقم الإجابة الصحيحة (1= A, 2= B, ...) أو اكتب '-' إذا لا توجد إجابة صحيحة.", reply_markup=back_kb())
@@ -612,7 +612,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         correct = chr(65 + idx)
                     else:
                         correct = None
-                except:
+                except Exception:
                     correct = None
             qtxt = state["tmp"]["question"]
             opts = state["tmp"]["options"]
@@ -739,7 +739,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # تعديل جميع الاختيارات دفعة واحدة
     if state.get("action") == "edit_all_opts":
         db_id = state.get("db_id")
-        lines = [clean_option_line(l) for l in text.splitlines() if l.strip()]
+        lines = [clean_option_line(line) for line in text.splitlines() if line.strip()]
         if not lines:
             await update.message.reply_text("❌ لم يتم العثور على أي اختيارات.", reply_markup=main_menu_kb())
             USER_STATE.pop(user_id, None)
@@ -1022,7 +1022,6 @@ async def publish_all_to_chat(chat_id, context: ContextTypes.DEFAULT_TYPE, is_sa
     else:
         logger.info("النشر في محادثة أخرى - سيتم استخدام التأخير")
     
-    success = True
     
     # Process in batches of PUBLISH_BATCH_SIZE
     for batch_start in range(0, len(rows), PUBLISH_BATCH_SIZE):
@@ -1059,7 +1058,6 @@ async def publish_all_to_chat(chat_id, context: ContextTypes.DEFAULT_TYPE, is_sa
             except Exception:
                 logger.warning("❌ خطأ غير متوقع عند إرسال السؤال %s", r["db_id"])
                 failed_ids.append(r["db_id"])
-                success = False
 
             # تحديث رسالة التقدم بعد كل سؤال
             if progress_msg:
@@ -1103,8 +1101,8 @@ async def publish_all_to_chat(chat_id, context: ContextTypes.DEFAULT_TYPE, is_sa
     # تحديث رسالة التقدم النهائية
     if progress_msg:
         try:
-            final_msg = f"✅ اكتملت العملية!\n\n"
-            final_msg += f"� إحصائيات النشر:\n"
+            final_msg = "✅ اكتملت العملية!\n\n"
+            final_msg += "📊 إحصائيات النشر:\n"
             final_msg += f"• إجمالي الأسئلة: {total}\n"
             final_msg += f"• تم إرسال بنجاح: {sent}\n"
             if failed_ids:
@@ -1121,8 +1119,8 @@ async def publish_all_to_chat(chat_id, context: ContextTypes.DEFAULT_TYPE, is_sa
             pass
             
     # تحديث الرسالة النهائية
-    final_msg = f"✅ اكتملت العملية!\n\n"
-    final_msg += f"📊 إحصائيات النشر:\n"
+    final_msg = "✅ اكتملت العملية!\n\n"
+    final_msg += "📊 إحصائيات النشر:\n"
     final_msg += f"• إجمالي الأسئلة: {total}\n"
     final_msg += f"• تم إرسال بنجاح: {sent}\n"
     if failed_ids:
@@ -1339,7 +1337,8 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("set_correct:"):
         parts = data.split(":")
-        db_id = int(parts[1]); letter = parts[2].upper()
+        db_id = int(parts[1])
+        letter = parts[2].upper()
         update_question_db(db_id, correct=letter)
         await query.edit_message_text(f"✅ تم تعيين الإجابة الصحيحة: {letter}", reply_markup=main_menu_kb())
         return
