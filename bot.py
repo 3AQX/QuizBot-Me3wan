@@ -25,6 +25,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # يُقرأ من .env
 DB_PATH = "quizbot.db"
 DOWNLOADS = "downloads"
 os.makedirs(DOWNLOADS, exist_ok=True)
@@ -70,6 +71,17 @@ def get_pending_questions_db():
     rows = c.fetchall()
     conn.close()
     return [{"db_id": r[0], "qtext": r[1], "options": json.loads(r[2]), "correct": r[3]} for r in rows]
+
+def get_unanswered_questions_db():
+    """إرجاع الأسئلة المعلقة التي لا تحتوي على إجابة صحيحة."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, qtext FROM questions WHERE status='pending' AND (correct_letter IS NULL OR correct_letter='')"
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [{"db_id": r[0], "qtext": r[1]} for r in rows]
 
 def get_question_db_by_index(idx: int):
     rows = get_pending_questions_db()
@@ -132,7 +144,23 @@ def pending_count_db():
     return cnt
 
 # ---------- تحليل النص و تنظيف الاختيارات ----------
-CHOICE_PATTERN = re.compile(r'([A-E])\s*[-\.\)]\s*(.*?)(?=(?:[A-E]\s*[-\.\)]|$))', re.I | re.S)
+# دعم حتى 10 خيارات (A إلى J)
+CHOICE_PATTERN = re.compile(r'([A-Ja-j])\s*[-\.\)]\s*(.*?)(?=(?:[A-Ja-j]\s*[-\.\)]|$))', re.I | re.S)
+
+# أنماط الأسطر التي يجب تجاهلها لمنع تلوث نص السؤال
+IGNORE_LINE_PATTERNS = [
+    re.compile(r'^\s*(Answer[s]?|Correct|Solution|Note[s]?|Reference[s]?|Source|Figure|Table)\s*[\:\-]', re.I),
+    re.compile(r'^\s*[\*\-_=]{3,}\s*$'),
+]
+
+# نمط السؤال بصيغة Q: أو Question:
+Q_PREFIX_PATTERN = re.compile(r'^\s*(?:Q\.?\s*\d*|Question\.?\s*\d*)\s*[\:\-]\s*(.+)', re.I)
+
+def is_ignored_line(line: str) -> bool:
+    for pat in IGNORE_LINE_PATTERNS:
+        if pat.match(line):
+            return True
+    return False
 
 def split_choices_from_line(line: str):
     matches = list(CHOICE_PATTERN.finditer(line))
@@ -149,18 +177,19 @@ def split_choices_from_line(line: str):
 def clean_option_line(line: str) -> str:
     """
     يحذف بادئة (A- أو B. أو C) فقط إذا كانت بداية السطر.
-    لا يمس أول حرف من الكلمات مثل 'Appendix'
+    يدعم الآن حتى J (10 خيارات).
     """
     line = line.strip()
-    cleaned = re.sub(r'^[A-Ea-e]\s*[-\.\)]\s*', '', line)
+    cleaned = re.sub(r'^[A-Ja-j]\s*[-\.\)]\s*', '', line)
     return cleaned
 
 def clean_question_text(q: str) -> str:
     if not q:
         return q
-    # Remove trailing numbers and any text after question mark
+    # القطع عند آخر علامة استفهام وليس الأولى (إصلاح: أسئلة بأكثر من ?)
     if '?' in q:
-        q = q.split('?')[0] + '?'
+        idx = q.rfind('?')
+        q = q[:idx + 1]
     q = re.sub(r'\s{2,}', ' ', q).strip()
     return q
 
@@ -181,24 +210,141 @@ def parse_pdf_pages(file_path: str, selected_pages: List[int]) -> List[str]:
         logger.exception("خطأ أثناء قراءة صفحات PDF")
     return lines
 
+
+def _parse_questions_from_lines(lines: List[str]) -> List[dict]:
+    """المحلل الأساسي: يبحث عن أرقام أو Q: كبداية لكل سؤال."""
+    questions = []
+    current_q = None
+    for line in lines:
+        line_s = line.strip()
+        if not line_s or is_ignored_line(line_s):
+            continue
+        # نمط Q: / Question:
+        qm = Q_PREFIX_PATTERN.match(line_s)
+        if qm:
+            if current_q:
+                questions.append(current_q)
+            current_q = {"question": qm.group(1).strip(), "options": []}
+            continue
+        # نمط رقمي: 1. أو 1- أو 1) أو 1:
+        if re.match(r'^\s*\d+\s*[\.\-\)\:]', line_s):
+            if current_q:
+                questions.append(current_q)
+            qtxt = re.sub(r'^\s*\d+\s*[\.\-\)\:]\s*', '', line_s).strip()
+            current_q = {"question": qtxt, "options": []}
+            continue
+        # نمط اختيار: A- أو A. أو A)
+        if re.match(r'^\s*[A-Ja-j]\s*[\.\-\)]', line_s):
+            if current_q is None:
+                continue
+            multi = split_choices_from_line(line_s)
+            if multi:
+                for m in multi:
+                    current_q["options"].append(clean_option_line(m))
+            else:
+                current_q["options"].append(clean_option_line(line_s))
+            continue
+        # سطر عادي — يضاف لنص السؤال مع حد أقصى 1000 حرف ليسمح بحفظه وإعطاء تنبيه للمستخدم لاحقاً
+        if current_q and len(current_q["question"]) < 1000:
+            current_q["question"] += " " + line_s
+    if current_q:
+        questions.append(current_q)
+    return questions
+
+def _fallback_parser(lines: List[str]) -> List[dict]:
+    """محلل بديل مرن: يبحث عن سطر (غير خيار) يليه مباشرة سطر يبدأ بحرف كخيار."""
+    questions = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line or is_ignored_line(line):
+            i += 1
+            continue
+        next_is_opt = (
+            i + 1 < len(lines)
+            and re.match(r'^\s*[A-Ja-j]\s*[\.\-\)]', lines[i + 1].strip())
+        )
+        if next_is_opt and len(line) < 1000 and not re.match(r'^\s*[A-Ja-j]\s*[\.\-\)]', line):
+            current_q = {"question": line, "options": []}
+            i += 1
+            while i < len(lines):
+                opt_line = lines[i].strip()
+                if not opt_line:
+                    i += 1
+                    break
+                if re.match(r'^\s*[A-Ja-j]\s*[\.\-\)]', opt_line):
+                    multi = split_choices_from_line(opt_line)
+                    if multi:
+                        for m in multi:
+                            current_q["options"].append(clean_option_line(m))
+                    else:
+                        current_q["options"].append(clean_option_line(opt_line))
+                    i += 1
+                else:
+                    break
+            if current_q["options"]:
+                questions.append(current_q)
+        else:
+            i += 1
+    return questions
+
 def parse_questions_from_file(file_path: str, pdf_pages: List[int] = None):
     ext = os.path.splitext(file_path)[1].lower()
     lines = []
     try:
         if ext in [".xlsx", ".xls"]:
-            df = pd.read_excel(file_path, header=None)
+            engine = "openpyxl" if ext == ".xlsx" else "xlrd"
+            df = pd.read_excel(file_path, header=None, engine=engine)
             for row in df.values:
-                line = " ".join([str(x) for x in row if str(x) != 'nan'])
+                line = " ".join([str(x) for x in row if str(x) not in ('nan', 'None', '')])
                 if line.strip():
                     lines.append(line.strip())
-        elif ext in [".csv", ".txt"]:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                lines = [l.rstrip("\n") for l in f if l.strip()]
+        elif ext == ".csv":
+            loaded = False
+            for enc in ["utf-8-sig", "utf-8", "cp1256", "latin-1"]:
+                try:
+                    df = pd.read_csv(file_path, header=None, encoding=enc, dtype=str)
+                    for row in df.values:
+                        line = " ".join([str(x) for x in row if str(x) not in ('nan', 'None', '')])
+                        if line.strip():
+                            lines.append(line.strip())
+                    loaded = True
+                    break
+                except Exception:
+                    continue
+            if not loaded:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = [l.rstrip("\n") for l in f if l.strip()]
+        elif ext == ".txt":
+            # دعم عدة ترميزات مع أولوية UTF-8-SIG للملفات العربية
+            lines_loaded = False
+            for enc in ["utf-8-sig", "utf-8", "cp1256", "latin-1"]:
+                try:
+                    with open(file_path, "r", encoding=enc, errors="strict") as f:
+                        lines = [l.rstrip("\n") for l in f if l.strip()]
+                    lines_loaded = True
+                    break
+                except Exception:
+                    continue
+            if not lines_loaded:
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = [l.rstrip("\n") for l in f if l.strip()]
         elif ext == ".docx":
             doc = Document(file_path)
+            auto_counter = 0
+            NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
             for p in doc.paragraphs:
-                if p.text.strip():
-                    lines.append(p.text.strip())
+                if not p.text.strip():
+                    continue
+                text = p.text.strip()
+                has_auto_num = p._p.find(f'{NS}numPr') is not None
+                already_numbered = bool(re.match(r'^\s*\d+', text))
+                is_option = bool(re.match(r'^\s*[A-Ja-j]\s*[\.\-\)]', text))
+                if has_auto_num and not already_numbered and not is_option:
+                    auto_counter += 1
+                    lines.append(f"{auto_counter}. {text}")
+                else:
+                    lines.append(text)
         elif ext == ".pdf":
             if pdf_pages:
                 lines = parse_pdf_pages(file_path, pdf_pages)
@@ -216,37 +362,18 @@ def parse_questions_from_file(file_path: str, pdf_pages: List[int] = None):
         logger.exception("file read error")
         return None
 
-    questions = []
-    current_q = None
-    for line in lines:
-        if re.match(r'^\s*\d+\s*[\.\-\)\:]', line):
-            if current_q:
-                questions.append(current_q)
-            qtxt = re.sub(r'^\s*\d+\s*[\.\-\)\:]\s*', '', line).strip()
-            current_q = {"question": qtxt, "options": []}
-        elif re.match(r'^\s*[A-Ea-e]\s*[\.\-\)]?', line):
-            if current_q is None:
-                continue
-            multi = split_choices_from_line(line)
-            if multi:
-                for m in multi:
-                    current_q["options"].append(clean_option_line(m))
-            else:
-                current_q["options"].append(clean_option_line(line))
-        else:
-            if current_q:
-                current_q["question"] += " " + line.strip()
-            else:
-                continue
-
-    if current_q:
-        questions.append(current_q)
+    # المحاولة الأولى: المحلل الأساسي
+    questions = _parse_questions_from_lines(lines)
+    # المحاولة الثانية: إذا فشل، جرب المحلل البديل المرن
+    if not questions and lines:
+        logger.info("المحلل الأساسي لم يجد أسئلة، جاري تجربة المحلل البديل...")
+        questions = _fallback_parser(lines)
 
     final = []
     for q in questions:
         opts = [o.strip() for o in q.get("options", []) if o and o.strip()]
         final.append({"qtext": clean_question_text(q["question"]), "options": opts})
-    return final
+    return final if final else None
 
 # ---------- حالة المستخدم ----------
 USER_STATE = {}  # user_id -> dict(action, step, tmp, ...)
@@ -274,12 +401,17 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not document:
         await update.message.reply_text("❌ أرسل ملفاً صالحاً.", reply_markup=main_menu_kb())
         return
+    if document.file_size and document.file_size > 20 * 1024 * 1024:
+        await update.message.reply_text("❌ عذراً، حجم الملف يجب أن لا يتجاوز 20 ميجابايت.", reply_markup=main_menu_kb())
+        return
     file = await document.get_file()
     filename = document.file_name
     path = os.path.join(DOWNLOADS, filename)
     await file.download_to_drive(path)
+    USER_STATE.pop(user_id, None)
 
     ext = os.path.splitext(filename)[1].lower()
+    supported = [".pdf", ".docx", ".txt", ".csv", ".xlsx", ".xls"]
     if ext == ".pdf":
         try:
             with pdfplumber.open(path) as pdf:
@@ -293,29 +425,48 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text("❌ خطأ في قراءة PDF.", reply_markup=main_menu_kb())
             USER_STATE.pop(user_id, None)
-    else:
+    elif ext in supported:
         await process_file_and_insert(update, context, path, pdf_pages=None)
+    else:
+        await update.message.reply_text(
+            f"❌ صيغة الملف `{ext}` غير مدعومة.\n\n✅ الصيغ المدعومة: PDF, DOCX, TXT, CSV, XLSX",
+            reply_markup=main_menu_kb(),
+            parse_mode="Markdown"
+        )
 
 async def process_file_and_insert(update_or_query, context: ContextTypes.DEFAULT_TYPE, path: str, pdf_pages: List[int] = None):
-    parsed = parse_questions_from_file(path, pdf_pages=pdf_pages)
-    is_query = hasattr(update_or_query, "callback_query")
-    if not parsed:
+    try:
+        parsed = parse_questions_from_file(path, pdf_pages=pdf_pages)
+        is_query = isinstance(update_or_query, CallbackQuery)
+        if not parsed:
+            if is_query:
+                await update_or_query.edit_message_text("❌ لم يتم العثور على أسئلة في الملف.", reply_markup=main_menu_kb())
+            else:
+                await update_or_query.message.reply_text("❌ لم يتم العثور على أسئلة في الملف.", reply_markup=main_menu_kb())
+            return
+        inserted = 0
+        flagged = 0
+        for q in parsed:
+            opts = q.get("options", []) or []
+            if len(opts) == 1:
+                opts.append("خيار فارغ")
+            if len(q["qtext"]) > 300 or len(opts) > 10:
+                flagged += 1
+            insert_question_db(q["qtext"], opts)
+            inserted += 1
+        msg = f"✅ تم استخراج وحفظ {inserted} سؤال."
+        if flagged > 0:
+            msg += f"\n\n⚠️ انتبه: تم اكتشاف {flagged} أسئلة تتجاوز 300 حرف لطول السؤال أو يبلغ عدد خياراتها أكثر من 10.\nيرجى تعديلها يدوياً من قسم المراجعة للتمكن من نشرها في تيليجرام."
         if is_query:
-            await update_or_query.edit_message_text("❌ لم يتم العثور على أسئلة في الملف.", reply_markup=main_menu_kb())
+            await update_or_query.edit_message_text(msg, reply_markup=main_menu_kb())
         else:
-            await update_or_query.message.reply_text("❌ لم يتم العثور على أسئلة في الملف.", reply_markup=main_menu_kb())
-        return
-    inserted = 0
-    for q in parsed:
-        opts = q.get("options", []) or []
-        if len(opts) == 1:
-            opts.append("خيار فارغ")
-        insert_question_db(q["qtext"], opts)
-        inserted += 1
-    if is_query:
-        await update_or_query.edit_message_text(f"✅ تم استخراج وحفظ {inserted} سؤال.", reply_markup=main_menu_kb())
-    else:
-        await update_or_query.message.reply_text(f"✅ تم استخراج وحفظ {inserted} سؤال.", reply_markup=main_menu_kb())
+            await update_or_query.message.reply_text(msg, reply_markup=main_menu_kb())
+    finally:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception as e:
+                logger.error(f"Error removing file {path}: {e}")
 
 # ---------- معالجة النص (state machine) ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -324,7 +475,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     text = (update.message.text or "").strip()
     state = USER_STATE.get(user_id)
-    if not state:
+    if not state or state.get("action") == "await_file":
+        if state and state.get("action") == "await_file":
+            USER_STATE.pop(user_id, None)
+        # إضافة الميزة الجديدة: تحليل الرسائل النصية المنسقة وكأنها ملف TXT
+        lines = text.splitlines()
+        questions = _parse_questions_from_lines(lines)
+        if not questions:
+            questions = _fallback_parser(lines)
+            
+        final = []
+        for q in questions:
+            opts = [o.strip() for o in q.get("options", []) if o and o.strip()]
+            final.append({"qtext": clean_question_text(q["question"]), "options": opts})
+            
+        if final:
+            inserted = 0
+            flagged = 0
+            for q in final:
+                opts = q.get("options", []) or []
+                if len(opts) == 1:
+                    opts.append("خيار فارغ")
+                if len(q["qtext"]) > 300 or len(opts) > 10:
+                    flagged += 1
+                insert_question_db(q["qtext"], opts)
+                inserted += 1
+            msg = f"✅ تم استخراج وحفظ {inserted} سؤال من رسالتك."
+            if flagged > 0:
+                msg += f"\n\n⚠️ انتبه: تم اكتشاف {flagged} أسئلة تتجاوز 300 حرف لطول السؤال أو يبلغ عدد خياراتها أكثر من 10.\nيرجى تعديلها يدوياً من قسم المراجعة للتمكن من نشرها في تيليجرام."
+            await update.message.reply_text(msg, reply_markup=main_menu_kb())
         return
 
     # PDF pages selection
@@ -507,8 +686,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
             
         opts = row["options"] if row["options"] else []
-        if len(opts) >= 5:
-            await update.message.reply_text("❌ لا يمكن إضافة المزيد من الاختيارات.", reply_markup=main_menu_kb())
+        if len(opts) >= 10:
+            await update.message.reply_text("❌ لا يمكن إضافة المزيد من الاختيارات (الحد الأقصى 10).", reply_markup=main_menu_kb())
             USER_STATE.pop(user_id, None)
             return
             
@@ -535,8 +714,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state.get("action") == "delete_opt":
         db_id = state.get("db_id")
         letter = text.strip().upper()
-        if not letter.isalpha() or not ('A' <= letter <= 'E'):
-            await update.message.reply_text("❌ أدخل حرفًا صحيحًا من A إلى E.", reply_markup=back_kb())
+        if not letter.isalpha() or not ('A' <= letter <= 'J'):
+            await update.message.reply_text("❌ أدخل حرفًا صحيحًا من A إلى J.", reply_markup=back_kb())
             return
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -560,37 +739,36 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ====== إرسال الأسئلة إلى ID آخر ======
     if state.get("action") == "await_target_id":
         target_id = text.strip()
-        USER_STATE.pop(user_id, None)
         try:
-            # إرسال رسالة تأكيد في محادثة البوت
+            target_int = int(target_id)
+        except ValueError:
+            await update.message.reply_text("❌ الـ ID غير صحيح، أعد المحاولة.", reply_markup=back_kb())
+            return
+        unanswered = get_unanswered_questions_db()
+        if unanswered:
+            q_list = "\n".join(
+                [f"• {q['qtext'][:70]}{'...' if len(q['qtext'])>70 else ''}" for q in unanswered[:10]]
+            )
+            more = f"\n... و{len(unanswered)-10} غيرها" if len(unanswered) > 10 else ""
+            USER_STATE[user_id] = {"action": "pending_publish", "chat_id": target_int, "is_same_chat": False, "progress_chat_id": update.message.chat_id}
+            await update.message.reply_text(
+                f"⚠️ يوجد *{len(unanswered)}* سؤال بدون إجابة صحيحة:\n\n{q_list}{more}\n\nماذا تريد أن تفعل بها؟",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📤 نشرها كاستطلاع رأي (بدون إجابة)", callback_data="publish_unanswered_as_poll")],
+                    [InlineKeyboardButton("⏩ نشر الجميع (المجهولة الإجابة A تلقائياً)", callback_data="publish_all_force")],
+                    [InlineKeyboardButton("🔙 رجوع لتحديد الإجابات", callback_data="main")]
+                ])
+            )
+        else:
+            USER_STATE.pop(user_id, None)
             await update.message.reply_text(f"📤 جاري إرسال الأسئلة إلى الشات ID: `{target_id}` ...", parse_mode="Markdown")
-            # تمرير محادثة البوت كمكان لعرض التقدم
-            await publish_all_to_chat(int(target_id), context, is_same_chat=False, progress_chat_id=update.message.chat_id)
-        except Exception as e:
-            await update.message.reply_text(f"❌ فشل الإرسال.\nتأكد أن البوت عضو في الشات وله صلاحية إرسال الرسائل.\n\nالخطأ:\n`{e}`", parse_mode="Markdown", reply_markup=main_menu_kb())
+            try:
+                await publish_all_to_chat(target_int, context, is_same_chat=False, progress_chat_id=update.message.chat_id)
+            except Exception as e:
+                await update.message.reply_text(f"❌ فشل الإرسال.\nتأكد أن البوت عضو في الشات.\n\n`{e}`", parse_mode="Markdown", reply_markup=main_menu_kb())
         return
 
-# ✅ عندما يستقبل البوت رسالة من قناة، يرسل الـ ID على الخاص للمسؤول
-async def detect_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send channel ID to the bot owner when the bot receives a channel message.
-
-    The function is tolerant if update has no chat. Replace admin_id with your
-    personal Telegram ID.
-    """
-    chat = update.effective_chat
-    if not chat:
-        return
-    if chat.type == "channel":
-        admin_id = 1101824671  # ← ضع هنا الـ ID الخاص بك (مش اسم المستخدم)
-        msg = (
-            f"📢 تم استقبال رسالة من قناة:\n"
-            f"📛 الاسم: {chat.title}\n"
-            f"🆔 ID القناة: `{chat.id}`"
-        )
-        try:
-            await context.bot.send_message(admin_id, msg, parse_mode="Markdown")
-        except Exception as e:
-            logger.warning("لم أستطع إرسال ID القناة إلى الخاص: %s", e)
 
 # ---------- عرض قوائم وحذف ونشر ----------
 async def show_delete_list(query: CallbackQuery, context, start=0, page_size=10):
@@ -621,8 +799,12 @@ async def show_delete_list(query: CallbackQuery, context, start=0, page_size=10)
 
 async def show_review_question(query, context, idx=0):
     row = get_question_db_by_index(idx)
+    is_query = isinstance(query, CallbackQuery)
     if not row:
-        await query.edit_message_text("لا يوجد سؤال بهذا الرقم.", reply_markup=main_menu_kb())
+        if is_query:
+            await query.edit_message_text("لا يوجد سؤال بهذا الرقم.", reply_markup=main_menu_kb())
+        else:
+            await query.message.reply_text("لا يوجد سؤال بهذا الرقم.", reply_markup=main_menu_kb())
         return
 
     opts = row["options"]
@@ -631,7 +813,7 @@ async def show_review_question(query, context, idx=0):
     
     # Count options
     opt_count = len(opts) if opts else 0
-    can_add_option = opt_count < 5  # Maximum 5 options (A-E)
+    can_add_option = opt_count < 10  # تليجرام يدعم حتى 10 خيارات
     
     text = f"السؤال {idx+1}/{row['total']}:\n\n{row['qtext']}\n\n{opts_text}\n\nالإجابة الصحيحة: {corr}"
 
@@ -675,7 +857,10 @@ async def show_review_question(query, context, idx=0):
     ])
     buttons.append([InlineKeyboardButton("↩️ القائمة الرئيسية", callback_data="main")])
 
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    if is_query:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    else:
+        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 async def show_goto_menu(query, start=0):
     rows = get_pending_questions_db()
@@ -710,7 +895,7 @@ async def show_goto_menu(query, start=0):
 
 
 # ---------- نشر ----------
-async def publish_one_db(chat_id, context: ContextTypes.DEFAULT_TYPE, db_id: int):
+async def publish_one_db(chat_id, context: ContextTypes.DEFAULT_TYPE, db_id: int, as_regular_poll: bool = False):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT qtext, options_json, correct_letter FROM questions WHERE id=?", (db_id,))
@@ -726,26 +911,33 @@ async def publish_one_db(chat_id, context: ContextTypes.DEFAULT_TYPE, db_id: int
         idx = ord(correct.upper()) - ord('A')
         if 0 <= idx < len(opts_json):
             correct_index = idx
-    if correct_index is None:
-        correct_index = 0
-    # Retry on timeout up to 3 attempts with exponential backoff
+    # إذا كان بدون إجابة صحيحة وطلب إرسالها كاستطلاع رأي
+    send_as_regular = as_regular_poll or (correct_index is None)
     attempts = 0
     while attempts < PUBLISH_RETRY:
         try:
-            await context.bot.send_poll(
-                chat_id=chat_id,
-                question=qtext,
-                options=opts_json,
-                type=Poll.QUIZ,
-                correct_option_id=correct_index,
-                is_anonymous=True
-            )
+            if send_as_regular:
+                await context.bot.send_poll(
+                    chat_id=chat_id,
+                    question=qtext,
+                    options=opts_json,
+                    type=Poll.REGULAR,
+                    is_anonymous=True
+                )
+            else:
+                await context.bot.send_poll(
+                    chat_id=chat_id,
+                    question=qtext,
+                    options=opts_json,
+                    type=Poll.QUIZ,
+                    correct_option_id=correct_index,
+                    is_anonymous=True
+                )
             mark_published_db(db_id)
             return True
         except TimedOut:
             attempts += 1
             logger.warning("Timed out sending poll db_id=%s to chat=%s (attempt %s)", db_id, chat_id, attempts)
-            # backoff: increase sleep with attempts
             await asyncio.sleep(PUBLISH_RETRY_BACKOFF * attempts)
             continue
         except TelegramError as e:
@@ -757,7 +949,7 @@ async def publish_one_db(chat_id, context: ContextTypes.DEFAULT_TYPE, db_id: int
     logger.error("Failed to send poll db_id=%s to chat=%s after %s attempts", db_id, chat_id, attempts)
     return False
 
-async def publish_all_to_chat(chat_id, context: ContextTypes.DEFAULT_TYPE, is_same_chat: bool = False, progress_chat_id: int = None):
+async def publish_all_to_chat(chat_id, context: ContextTypes.DEFAULT_TYPE, is_same_chat: bool = False, progress_chat_id: int = None, send_unanswered_as_poll: bool = True):
     rows = get_pending_questions_db()
     total = len(rows)
     if total == 0:
@@ -795,7 +987,7 @@ async def publish_all_to_chat(chat_id, context: ContextTypes.DEFAULT_TYPE, is_sa
         # Send each question in the batch
         for r in batch:
             try:
-                ok = await publish_one_db(chat_id, context, r["db_id"])
+                ok = await publish_one_db(chat_id, context, r["db_id"], as_regular_poll=(send_unanswered_as_poll and not r.get("correct")))
                 if ok:
                     sent += 1
                     batch_sent += 1
@@ -947,13 +1139,62 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "delete_all":
+        cnt = pending_count_db()
+        if cnt == 0:
+            await query.edit_message_text("❌ لا توجد أسئلة لحذفها.", reply_markup=main_menu_kb())
+        else:
+            await query.edit_message_text(
+                f"⚠️ تنبيه! أنت على وشك حذف *{cnt}* سؤال بشكل نهائي.لا يمكن التراجع!\n\nهل أنت متأكد؟",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ نعم احذف الكل", callback_data="delete_all_confirm")],
+                    [InlineKeyboardButton("❌ إلغاء", callback_data="main")]
+                ])
+            )
+        return
+
+    if data == "delete_all_confirm":
         delete_all_db()
         await query.edit_message_text("✅ تم حذف جميع الأسئلة من القاعدة.", reply_markup=main_menu_kb())
         return
 
     if data == "publish_all_here":
-        # عند النشر في نفس المحادثة نستخدم is_same_chat=True
-        await publish_all_to_chat(query.message.chat_id, context, is_same_chat=True, progress_chat_id=query.message.chat_id)
+        unanswered = get_unanswered_questions_db()
+        if unanswered:
+            q_list = "\n".join(
+                [f"• {q['qtext'][:70]}{'...' if len(q['qtext'])>70 else ''}" for q in unanswered[:10]]
+            )
+            more = f"\n... و{len(unanswered)-10} غيرها" if len(unanswered) > 10 else ""
+            USER_STATE[uid] = {"action": "pending_publish", "chat_id": query.message.chat_id, "is_same_chat": True, "progress_chat_id": query.message.chat_id}
+            await query.edit_message_text(
+                f"⚠️ يوجد *{len(unanswered)}* سؤال بدون إجابة صحيحة:\n\n{q_list}{more}\n\nماذا تريد أن تفعل بها؟",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📤 نشرها كاستطلاع رأي (بدون إجابة)", callback_data="publish_unanswered_as_poll")],
+                    [InlineKeyboardButton("⏩ نشر الجميع (المجهولة الإجابة A تلقائياً)", callback_data="publish_all_force")],
+                    [InlineKeyboardButton("🔙 رجوع لتحديد الإجابات", callback_data="main")]
+                ])
+            )
+        else:
+            await publish_all_to_chat(query.message.chat_id, context, is_same_chat=True, progress_chat_id=query.message.chat_id)
+        return
+
+    if data == "publish_unanswered_as_poll":
+        state = USER_STATE.pop(uid, {})
+        chat_id = state.get("chat_id", query.message.chat_id)
+        is_same = state.get("is_same_chat", True)
+        prog_id = state.get("progress_chat_id", query.message.chat_id)
+        await query.edit_message_text("🚀 جاري نشر الأسئلة (الأسئلة بدون إجابة ستُرسل كاستطلاع رأي)...")
+        await publish_all_to_chat(chat_id, context, is_same_chat=is_same, progress_chat_id=prog_id, send_unanswered_as_poll=True)
+        return
+
+    if data == "publish_all_force":
+        state = USER_STATE.pop(uid, {})
+        chat_id = state.get("chat_id", query.message.chat_id)
+        is_same = state.get("is_same_chat", True)
+        prog_id = state.get("progress_chat_id", query.message.chat_id)
+        await query.edit_message_text("🚀 جاري نشر جميع الأسئلة...")
+        await publish_all_to_chat(chat_id, context, is_same_chat=is_same, progress_chat_id=prog_id, send_unanswered_as_poll=False)
         return
 
     if data == "pdf_confirm":
@@ -1025,17 +1266,17 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("delete_opt:"):
         db_id = int(data.split(":")[1])
         USER_STATE[uid] = {"action": "delete_opt", "db_id": db_id}
-        await query.edit_message_text("🗑️ اكتب الحرف (A–E) للاختيار الذي تريد حذفه:", reply_markup=back_kb())
+        await query.edit_message_text("🗑️ اكتب الحرف (A–J) للاختيار الذي تريد حذفه:", reply_markup=back_kb())
         return
         
     if data.startswith("add_opt:"):
         db_id = int(data.split(":")[1])
         row = get_question_db(db_id)
-        if row and (not row["options"] or len(row["options"]) < 5):
+        if row and (not row["options"] or len(row["options"]) < 10):
             USER_STATE[uid] = {"action": "add_opt", "db_id": db_id}
             await query.edit_message_text("✏️ أرسل نص الاختيار الجديد:", reply_markup=back_kb())
         else:
-            await query.answer("لا يمكن إضافة المزيد من الاختيارات")
+            await query.answer("لا يمكن إضافة المزيد من الاختيارات (الحد الأقصى 10)")
         return
 
 
@@ -1055,14 +1296,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("❌ حدث خطأ أثناء نشر السؤال.", reply_markup=main_menu_kb())
         return
-    if data == "goto_question":
-        await show_goto_menu(query)
-        return
 
-    if data.startswith("goto_page:"):
-        start = int(data.split(":")[1])
-        await show_goto_menu(query, start=start)
-        return
 
     if data == "send_to_id":
         USER_STATE[uid] = {"action": "await_target_id"}
@@ -1092,7 +1326,6 @@ async def detect_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     chat = update.channel_post.chat
-    admin_id = 1101824671  # ← ضع هنا ID حسابك الشخصي
 
     msg = (
         f"📢 تم استقبال منشور من قناة:\n"
@@ -1101,8 +1334,8 @@ async def detect_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     try:
-        await context.bot.send_message(admin_id, msg, parse_mode="Markdown")
-        print(f"✅ تم إرسال ID القناة إليك على الخاص ({admin_id})")
+        await context.bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
+        print(f"✅ تم إرسال ID القناة إليك على الخاص ({ADMIN_ID})")
     except Exception as e:
         print(f"⚠️ لم أستطع إرسال ID القناة إلى الخاص: {e}")
 
