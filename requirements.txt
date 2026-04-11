@@ -4,3 +4,5 @@ pdfplumber
 python-docx
 flask
 python-dotenv
+openpyxl
+xlrd
