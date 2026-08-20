@@ -1,11 +1,13 @@
-# bot.py — النسخة المحدثة: بتاريخ 11 ابريل 2026
+# bot.py — النسخة المحدثة: بتاريخ 20 اغسطس 2026
+# اضافة flask لتشغيل البوت على Render
 import os
 import re
 import json
 import logging
 import sqlite3
 from typing import List
-
+from flask import Flask
+import threading
 import pdfplumber
 import pandas as pd
 from docx import Document
@@ -1403,9 +1405,29 @@ async def detect_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("مرحباً أيها المعواني — اختر إجراء:", reply_markup=main_menu_kb())
 
+# ---------- Render Health Check ----------
+web_app = Flask(__name__)
+
+@web_app.route("/")
+def home():
+    return "QuizBot is running!", 200
+
+@web_app.route("/health")
+def health():
+    return "OK", 200
+
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    web_app.run(host="0.0.0.0", port=port)
+
 # ---------- التشغيل ----------
 def main():
     init_db()
+
+    # Start Flask server for Render
+    threading.Thread(target=run_web_server, daemon=True).start()
+
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
