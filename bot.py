@@ -32,6 +32,29 @@ DB_PATH = "quizbot.db"
 DOWNLOADS = "downloads"
 os.makedirs(DOWNLOADS, exist_ok=True)
 
+
+def connect_db():
+    """Connect to Turso in deployment, or to local SQLite during development."""
+    turso_url = os.getenv("TURSO_DATABASE_URL")
+    turso_token = os.getenv("TURSO_AUTH_TOKEN")
+    require_turso = os.getenv("REQUIRE_TURSO", "false").lower() == "true"
+
+    if turso_url or turso_token:
+        if not turso_url or not turso_token:
+            raise RuntimeError(
+                "Both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be configured."
+            )
+        import turso_serverless
+
+        return turso_serverless.connect(turso_url, auth_token=turso_token)
+
+    if require_turso:
+        raise RuntimeError(
+            "TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are required for this deployment."
+        )
+
+    return sqlite3.connect(DB_PATH)
+
 # Publish tuning (configurable via environment variables)
 PUBLISH_RETRY = int(os.getenv("PUBLISH_RETRY", "3"))
 PUBLISH_DELAY = 0  # No delay between questions in a batch
@@ -42,7 +65,7 @@ PUBLISH_BATCH_PAUSE = 3.0  # 3 second pause between batches
 
 # ---------- قاعدة البيانات ----------
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
     c.execute("""
     CREATE TABLE IF NOT EXISTS questions (
@@ -57,7 +80,7 @@ def init_db():
     conn.close()
 
 def insert_question_db(qtext: str, options: List[str], correct: str = None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
     c.execute(
         "INSERT INTO questions (qtext, options_json, correct_letter) VALUES (?, ?, ?)",
@@ -67,7 +90,7 @@ def insert_question_db(qtext: str, options: List[str], correct: str = None):
     conn.close()
 
 def get_pending_questions_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
     c.execute("SELECT id, qtext, options_json, correct_letter FROM questions WHERE status='pending' ORDER BY id")
     rows = c.fetchall()
@@ -75,7 +98,7 @@ def get_pending_questions_db():
     return [{"db_id": r[0], "qtext": r[1], "options": json.loads(r[2]), "correct": r[3]} for r in rows]
 
 def get_flagged_questions_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
     c.execute("SELECT id, qtext, options_json, correct_letter FROM questions WHERE status='pending' ORDER BY id")
     rows = c.fetchall()
@@ -99,7 +122,7 @@ def get_flagged_questions_db():
 
 def get_unanswered_questions_db():
     """إرجاع الأسئلة المعلقة التي لا تحتوي على إجابة صحيحة."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
     c.execute(
         "SELECT id, qtext FROM questions WHERE status='pending' AND (correct_letter IS NULL OR correct_letter='')"
@@ -118,7 +141,7 @@ def get_question_db_by_index(idx: int, flagged_only: bool = False):
     return None
 
 def update_question_db(db_id: int, qtext: str = None, options: List[str] = None, correct: str = None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
     if qtext is not None:
         c.execute("UPDATE questions SET qtext=? WHERE id=?", (qtext, db_id))
@@ -130,14 +153,14 @@ def update_question_db(db_id: int, qtext: str = None, options: List[str] = None,
     conn.close()
 
 def delete_question_db(db_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
     c.execute("DELETE FROM questions WHERE id=?", (db_id,))
     conn.commit()
     conn.close()
 
 def get_question_db(db_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
     c.execute("SELECT id, qtext, options_json, correct_letter FROM questions WHERE id=?", (db_id,))
     row = c.fetchone()
@@ -147,21 +170,21 @@ def get_question_db(db_id: int):
     return None
 
 def delete_all_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
     c.execute("DELETE FROM questions")
     conn.commit()
     conn.close()
 
 def mark_published_db(db_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
     c.execute("UPDATE questions SET status='published' WHERE id=?", (db_id,))
     conn.commit()
     conn.close()
 
 def pending_count_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM questions WHERE status='pending'")
     cnt = c.fetchone()[0]
@@ -688,7 +711,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state.get("action") == "edit_one_text":
         db_id = state.get("db_id")
         letter = state.get("letter")
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_db()
         c = conn.cursor()
         c.execute("SELECT options_json FROM questions WHERE id=?", (db_id,))
         row = c.fetchone()
@@ -758,7 +781,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not letter.isalpha() or not ('A' <= letter <= 'J'):
             await update.message.reply_text("❌ أدخل حرفًا صحيحًا من A إلى J.", reply_markup=back_kb())
             return
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_db()
         c = conn.cursor()
         c.execute("SELECT options_json FROM questions WHERE id=?", (db_id,))
         row = c.fetchone()
@@ -943,7 +966,7 @@ async def show_goto_menu(query, start=0):
 
 # ---------- نشر ----------
 async def publish_one_db(chat_id, context: ContextTypes.DEFAULT_TYPE, db_id: int, as_regular_poll: bool = False):
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     c = conn.cursor()
     c.execute("SELECT qtext, options_json, correct_letter FROM questions WHERE id=?", (db_id,))
     row = c.fetchone()

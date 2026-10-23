@@ -6,3 +6,4 @@ flask
 python-dotenv
 openpyxl
 xlrd
+turso_serverless
